@@ -56,48 +56,40 @@ class SemanticSimRetriever(BaseRetriever):
 
     def __init__(self, config):
         super().__init__(config)
-        # self.corpus = load_corpus(self.corpus_path)
-        # self.topk = config.retrieval_topk
-        # self.batch_size = config.retrieval_batch_size
-        # from sentence_transformers import SentenceTransformer
-        # model_name = "/vast/jl11523/projects-local-models/all-mpnet-base-v2"
-        # self.model = SentenceTransformer(model_name)
-        # # load pre-computed embeddings
-        # embeddings_path = self.corpus_path.replace("_corpus.json", "_sbert_embeddings.pt")
-        # self.corpus_embs = torch.load(embeddings_path)
 
     def calculate_scores(self, corpus, node_id, cand_embs, q_emb, device):
         # semantic similarity between the query_embedding and the candidatets embedding, as the ranker
         calculater = self.config.score_method
-        if calculater == "SemQ" or calculater == "SemA" or calculater == "SemQA":
+        if calculater in ("SemQ", "SemA", "SemQA"):
             # attribute similarity between the query and query (query_only, attribute_only, query+attribute) <- decided by the searcher input
             scores = torch.nn.functional.cosine_similarity(cand_embs, q_emb.unsqueeze(0).expand_as(cand_embs), dim=1)  # [M]
+            return scores
         elif calculater == "WeightedSemQA":
             # weighted sum of semantic similarity and attribute similarity
             alpha = 0.5
             beta = 1 - alpha 
-            an_emb = corpus[int(node_id)].unsqueeze(0)  # anchor node emb: [1, d]
-            scores = alpha * torch.nn.functional.cosine_similarity(cand_embs, an_emb.unsqueeze(0).expand_as(cand_embs), dim=1) + \
+            an_emb = corpus[int(node_id)]            # [d]
+            scores = alpha * torch.nn.functional.cosine_similarity(cand_embs, an_emb.expand_as(cand_embs), dim=1) + \
                      beta * torch.nn.functional.cosine_similarity(cand_embs, q_emb.unsqueeze(0).expand_as(cand_embs), dim=1)
+            return scores
         elif calculater == "StrucSemQA":
             print(f"[Warining] {calculater} Not implemented yet.")
             raise NotImplementedError
         else:
             raise ValueError(f"Not supported score_method: {calculater}.")
         
-        return scores
     
 
-    def get_candidate_ids(self, curr_nb_id, topk):
+    def get_candidate_ids(self, node_id, curr_nb_id, topk):
         # Sem, Hop, PPR, Sem+Hop, Sem+PPR, Hop+PPR, Sem+Hop+PPR
         candidate_ids = []
         for nb in curr_nb_id:
             if "Sem" in self.config.candidate_filter:
-                candidate_ids.extend(self.corpus[nb]["semantic_neighbors"][:topk])
+                candidate_ids.extend(self.corpus[node_id]["semantic_neighbors"][:topk])
             if "Hop" in self.config.candidate_filter:
                 candidate_ids.extend(self.corpus[nb]["neighbors"][:topk])
             if "PPR" in self.config.candidate_filter:
-                candidate_ids.extend(self.corpus[nb]["ppr_neighbors"][:topk])
+                candidate_ids.extend(self.corpus[node_id]["ppr_neighbors"][:topk])
         candidate_ids = list(set(candidate_ids))  # unique
         # print("candidate_ids:", candidate_ids)
         return candidate_ids
@@ -113,8 +105,9 @@ class SemanticSimRetriever(BaseRetriever):
         corpus = self.corpus_embs
         if not torch.is_tensor(corpus):
             corpus = torch.tensor(corpus)
+
         device = batch_query_emb.device
-        corpus = corpus.to()
+        corpus = corpus.to(device)
         corpus = torch.nn.functional.normalize(corpus, p=2, dim=1)  # [N, d]
 
         k = min(topk, corpus.size(0))
@@ -124,7 +117,7 @@ class SemanticSimRetriever(BaseRetriever):
             if curr_nb_id is None or len(curr_nb_id) == 0:
                 raise ValueError("curr_nb_id cannot be None or empty.")
             # candidate set
-            candidate_ids = self.get_candidate_ids(curr_nb_id, topk)
+            candidate_ids = self.get_candidate_ids(node_id, curr_nb_id, topk)
             if not candidate_ids:
                 nb_ids.append([])
                 continue
@@ -139,7 +132,7 @@ class SemanticSimRetriever(BaseRetriever):
             # print("topk_local:", topk_local, "topk_global:", topk_global)
             nb_ids.append(topk_global)
 
-        print(f"Retrieved neighbors for node_ids{node_ids} queries: {nb_ids}.")
+        # print(f"Retrieved neighbors for node_ids{node_ids} queries: {nb_ids}.")
         return nb_ids
 
 
@@ -577,7 +570,7 @@ def retrieve_endpoint(request: QueryRequest):
     resp = []
     for i, single_result in enumerate(results):
         resp.append(single_result)
-    print("[POST Retrun] retrieve_endpoint:")
+    # print("[POST Return] retrieve_endpoint")
     return {"result": resp}
 
 
@@ -585,6 +578,7 @@ def retrieve_endpoint(request: QueryRequest):
 if __name__ == "__main__":
     
     parser = argparse.ArgumentParser(description="Launch the local faiss retriever.")
+    parser.add_argument("--port", type=int, default=8000, help="Port to run the server on.")
     parser.add_argument("--corpus_path", type=str, default="./dataset/cora/cora_corpus.json", help="Local corpus file.")
     parser.add_argument("--topk", type=int, default=3, help="Number of retrieved nodes for one query.")
     parser.add_argument("--retriever_name", type=str, default="semantic-similarity", help="Name of the retriever model.")
@@ -611,4 +605,4 @@ if __name__ == "__main__":
     retriever = get_retriever(config)
     
     # 3) Launch the server. By default, it listens on http://127.0.0.1:8000
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=args.port)
