@@ -37,18 +37,18 @@ class BaseRetriever:
     def _search(self, query: str, node_id: str, search_hop: int, num: int):
         raise NotImplementedError # Jiajin comments: actaully not been called yet
 
-    def _batch_search(self, queries: List[str], curr_nb_ids: List[List[str]], node_ids: List[str], search_hops: List[int], num: int):
+    def _batch_search(self, queries: List[str], curr_nb_ids: List[List[str]], node_ids: List[str], search_hops: List[int], num: int, mode: str):
         raise NotImplementedError 
 
     def search(self, query: str, node_id: str, search_hop: int, num: int):
         return self._search(query, node_id, search_hop, num) # Jiajin comments: actaully not been called yet
     
-    def batch_search(self, queries: List[str], curr_nb_ids: List[List[str]], node_ids: List[str], search_hops: List[int], num: int, candidate_filter: str, score_method: str):
+    def batch_search(self, queries: List[str], curr_nb_ids: List[List[str]], node_ids: List[str], search_hops: List[int], num: int, mode: str, candidate_filter: str, score_method: str):
         if candidate_filter is not None:
             self.config.candidate_filter = candidate_filter
         if score_method is not None:
             self.config.score_method = score_method
-        return self._batch_search(queries, curr_nb_ids, node_ids, search_hops, num)
+        return self._batch_search(queries, curr_nb_ids, node_ids, search_hops, num, mode)
 
 
 
@@ -59,12 +59,12 @@ class SemanticSimRetriever(BaseRetriever):
 
     def calculate_scores(self, corpus, node_id, cand_embs, q_emb, device):
         # semantic similarity between the query_embedding and the candidatets embedding, as the ranker
-        calculater = self.config.score_method
-        if calculater in ("SemQ", "SemA", "SemQA"):
+        calculator = self.config.score_method
+        if calculator in ("SemQ", "SemA", "SemQA"):
             # attribute similarity between the query and query (query_only, attribute_only, query+attribute) <- decided by the searcher input
             scores = torch.nn.functional.cosine_similarity(cand_embs, q_emb.unsqueeze(0).expand_as(cand_embs), dim=1)  # [M]
             return scores
-        elif calculater == "WeightedSemQA":
+        elif calculator == "WeightedSemQA":
             # weighted sum of semantic similarity and attribute similarity
             alpha = 0.5
             beta = 1 - alpha 
@@ -72,30 +72,32 @@ class SemanticSimRetriever(BaseRetriever):
             scores = alpha * torch.nn.functional.cosine_similarity(cand_embs, an_emb.expand_as(cand_embs), dim=1) + \
                      beta * torch.nn.functional.cosine_similarity(cand_embs, q_emb.unsqueeze(0).expand_as(cand_embs), dim=1)
             return scores
-        elif calculater == "StrucSemQA":
-            print(f"[Warining] {calculater} Not implemented yet.")
+        elif calculator == "StrucSemQA":
+            print(f"[Warining] {calculator} Not implemented yet.")
             raise NotImplementedError
         else:
-            raise ValueError(f"Not supported score_method: {calculater}.")
+            raise ValueError(f"Not supported score_method: {calculator}.")
         
     
 
     def get_candidate_ids(self, node_id, curr_nb_id, topk):
-        # Sem, Hop, PPR, Sem+Hop, Sem+PPR, Hop+PPR, Sem+Hop+PPR
+        # NonStruc, Sem, Hop, PPR, Sem+Hop, Sem+PPR, Hop+PPR, Sem+Hop+PPR
         candidate_ids = []
         for nb in curr_nb_id:
             if "Sem" in self.config.candidate_filter:
                 candidate_ids.extend(self.corpus[node_id]["semantic_neighbors"][:topk])
             if "Hop" in self.config.candidate_filter:
-                candidate_ids.extend(self.corpus[nb]["neighbors"][:topk])
+                candidate_ids.extend(self.corpus[nb]["neighbors"]) #[:topk])
             if "PPR" in self.config.candidate_filter:
                 candidate_ids.extend(self.corpus[node_id]["ppr_neighbors"][:topk])
+            if "NonStruc" in self.config.candidate_filter:
+                candidate_ids.extend(range(len(self.corpus)))  # all nodes
         candidate_ids = list(set(candidate_ids))  # unique
-        # print("candidate_ids:", candidate_ids)
+        print("candidate_ids:", candidate_ids)
         return candidate_ids
 
 
-    def retrieve_nb_ids(self, queries: List[str], node_ids: List[str], curr_nb_ids: List[List[str]], topk: int): # node_ids: unused
+    def retrieve_nb_ids(self, queries: List[str], node_ids: List[str], curr_nb_ids: List[List[str]], search_hops: List[int], topk: int, mode: str): # node_ids: unused
         batch_query_emb = self.model.encode(
             queries, convert_to_tensor=True,
             batch_size=self.batch_size, normalize_embeddings=True
@@ -113,11 +115,23 @@ class SemanticSimRetriever(BaseRetriever):
         k = min(topk, corpus.size(0))
         nb_ids = []
 
-        for q_emb, node_id, curr_nb_id in zip(batch_query_emb, node_ids, curr_nb_ids):
+        for q_emb, node_id, curr_nb_id, search_hop in zip(batch_query_emb, node_ids, curr_nb_ids, search_hops):
             if curr_nb_id is None or len(curr_nb_id) == 0:
                 raise ValueError("curr_nb_id cannot be None or empty.")
             # candidate set
+            print("mode:", mode, "search_hop:", search_hop)
+            if mode == "local":
+                if search_hop == 1:
+                    curr_nb_id = [node_id]
+                else:
+                    curr_nb_id = [str(nbi) for nbi in self.corpus[node_id]["neighbors"]]
+                self.config.candidate_filter = "Hop"  # local search
+            elif mode == "global":
+                self.config.candidate_filter = "PPR"  # global search
+            elif mode == "attribute":
+                self.config.candidate_filter = "Sem"  # global search
             candidate_ids = self.get_candidate_ids(node_id, curr_nb_id, topk)
+            
             if not candidate_ids:
                 nb_ids.append([])
                 continue
@@ -138,86 +152,20 @@ class SemanticSimRetriever(BaseRetriever):
 
     # Jiajin: no need yet
     def _search(self, query: str, node_id: str, search_hop: int, num: int):
-        if num is None:
-            num = self.topk
-        nb_ids = self.retrieve_nb_ids(node_id, search_hop, num)
-        results = [self.corpus[idx] for idx in nb_ids[0]]
-        return results
+        print("In _search() of SemanticSimRetriever. Not implemented yet.")
+        return []
 
-    def _batch_search(self, queries: List[str], curr_nb_ids: List[List[str]], node_ids: List[str], search_hops: List[int], num: int):
+    def _batch_search(self, queries: List[str], curr_nb_ids: List[List[str]], node_ids: List[str], search_hops: List[int], num: int, mode: str):
         if isinstance(queries, str):
             queries = [queries]
 
         results = []
         for start_idx in tqdm(range(0, len(queries), self.batch_size), desc='Retrieval process: '):
             query_batch = queries[start_idx:start_idx + self.batch_size]
-            curr_nb_ids_batch = curr_nb_ids[start_idx:start_idx + self.batch_size] # retrieve hop1 nbs based on ids in the requested list
-            batch_nb_ids = self.retrieve_nb_ids(query_batch, node_ids, curr_nb_ids_batch, num)
-            flat_nb_ids = [str(i) for i in sum(batch_nb_ids, [])]
-            batch_results = [self.corpus[idx] for idx in flat_nb_ids]
-            # chunk them back
-            batch_results = [batch_results[i*num : (i+1)*num] for i in range(len(batch_nb_ids))]
-            results.extend(batch_results)
-            
-            del batch_nb_ids, query_batch, flat_nb_ids, batch_results
-            torch.cuda.empty_cache()
-        
-        return results
-    
-
-
-
-
-
-class RandomRetriever(BaseRetriever):
-
-    def __init__(self, config):
-        super().__init__(config)
-        self.corpus = load_corpus(self.corpus_path)
-        self.topk = config.retrieval_topk
-        self.batch_size = config.retrieval_batch_size
-
-    def retrieve_nb_ids(self, node_ids: List[str], search_hops: List[int], topk: int):
-        nb_ids = []
-        for n_id, hop in zip(node_ids, search_hops):
-            n_id = int(n_id)
-            if hop == 0:
-                raise ValueError("Hop value cannot be 0.")
-            else:
-                if n_id >= len(self.corpus):
-                    raise ValueError(f"Node ID {n_id} exceeds the number of nodes in the index ({len(self.corpus)}).")
-                # retrieve neighbors from corpus
-                neighbors = self.corpus[str(n_id)]["nb"][f"hop{hop}"]
-                if not neighbors:
-                    warnings.warn(f"No neighbors found for Node ID {n_id} at hop {hop}. Returning empty list.")
-                    nb_ids.append([])
-                    continue
-                nb_ids.append(neighbors[:topk])
-        print(f"Retrieved neighbors for {len(node_ids)} nodes: {nb_ids}.")
-        return nb_ids
-
-
-    def _search(self, query: str, node_id: str, search_hop: int, num: int):
-        if num is None:
-            num = self.topk
-        nb_ids = self.retrieve_nb_ids(node_id, search_hop, num)
-        results = [self.corpus[idx] for idx in nb_ids[0]]
-        return results
-
-    def _batch_search(self, queries: List[str], curr_nb_ids: List[List[str]], node_ids: List[str], search_hops: List[int], num: int):
-        if isinstance(node_ids, str):
-            node_ids = [node_ids]
-        if isinstance(search_hops, int):
-            search_hops = [search_hops]
-        assert len(node_ids) == len(search_hops), "Length of node_ids and search_hops must be the same."
-        if num is None:
-            num = self.topk
-        
-        results = []
-        for start_idx in tqdm(range(0, len(node_ids), self.batch_size), desc='Retrieval process: '):
-            query_batch = node_ids[start_idx:start_idx + self.batch_size]
             search_hops_batch = search_hops[start_idx:start_idx + self.batch_size]
-            batch_nb_ids = self.retrieve_nb_ids(query_batch, search_hops_batch, num)
+            node_ids_batch = node_ids[start_idx:start_idx + self.batch_size]
+            curr_nb_ids_batch = curr_nb_ids[start_idx:start_idx + self.batch_size] # retrieve hop1 nbs based on ids in the requested list
+            batch_nb_ids = self.retrieve_nb_ids(query_batch, node_ids_batch, curr_nb_ids_batch, search_hops_batch, num, mode)
             flat_nb_ids = [str(i) for i in sum(batch_nb_ids, [])]
             batch_results = [self.corpus[idx] for idx in flat_nb_ids]
             # chunk them back
@@ -228,260 +176,8 @@ class RandomRetriever(BaseRetriever):
             torch.cuda.empty_cache()
         
         return results
+
     
-
-class RawSimRetriever(BaseRetriever):
-
-    def __init__(self, config):
-        super().__init__(config)
-        self.corpus = load_corpus(self.corpus_path)
-        self.topk = config.retrieval_topk
-        self.batch_size = config.retrieval_batch_size
-        from sentence_transformers import SentenceTransformer
-        model_name = "/vast/jl11523/projects-local-models/all-mpnet-base-v2"
-        self.model = SentenceTransformer(model_name)
-        # load pre-computed embeddings
-        embeddings_path = self.corpus_path.replace("_corpus.json", "_sbert_embeddings.pt")
-        self.corpus_embs = torch.load(embeddings_path)
-
-
-    def retrieve_nb_ids(self, queries: List[str], topk: int):
-        batch_query_emb = self.model.encode(
-            queries, convert_to_tensor=True,
-            batch_size=self.batch_size, normalize_embeddings=True
-        )  # [B, d]
-
-        corpus = self.corpus_embs
-        if not torch.is_tensor(corpus):
-            corpus = torch.tensor(corpus)
-        corpus = corpus.to(batch_query_emb.device)
-        corpus = torch.nn.functional.normalize(corpus, p=2, dim=1)  # [N, d]
-
-        k = min(topk, corpus.size(0))
-        nb_ids = []
-
-        for query_emb in batch_query_emb:  # no zip()
-            # [N, d] vs [d] -> extend to [N, d]
-            q_expanded = query_emb.unsqueeze(0).expand_as(corpus)  # [N, d]
-            scores = torch.nn.functional.cosine_similarity(corpus, q_expanded, dim=1)  # [N]
-            topk_ids = torch.topk(scores, k=k).indices.tolist()
-            nb_ids.append(topk_ids)
-
-        print(f"Retrieved neighbors for {len(queries)} queries: {nb_ids}.")
-        return nb_ids
-
-
-    def _search(self, query: str, node_id: str, search_hop: int, num: int):
-        nb_ids = self.retrieve_nb_ids([query], num)
-        results = [self.corpus[idx] for idx in nb_ids[0]]
-        return results
-
-    def _batch_search(self, queries: List[str], curr_nb_ids: List[List[str]], node_ids: List[str], search_hops: List[int], num: int):
-        if isinstance(queries, str):
-            queries = [queries]
-
-        results = []
-        for start_idx in tqdm(range(0, len(queries), self.batch_size), desc='Retrieval process: '):
-            query_batch = queries[start_idx:start_idx + self.batch_size]
-            batch_nb_ids = self.retrieve_nb_ids(query_batch, num)
-            flat_nb_ids = [str(i) for i in sum(batch_nb_ids, [])]
-            batch_results = [self.corpus[idx] for idx in flat_nb_ids]
-            # chunk them back
-            batch_results = [batch_results[i*num : (i+1)*num] for i in range(len(batch_nb_ids))]
-            results.extend(batch_results)
-            
-            del batch_nb_ids, query_batch, flat_nb_ids, batch_results
-            torch.cuda.empty_cache()
-        
-        return results
-
-
-
-
-class HopSimRetriever(BaseRetriever):
-
-    def __init__(self, config):
-        super().__init__(config)
-        self.corpus = load_corpus(self.corpus_path)
-        self.topk = config.retrieval_topk
-        self.batch_size = config.retrieval_batch_size
-        from sentence_transformers import SentenceTransformer
-        model_name = "/vast/jl11523/projects-local-models/all-mpnet-base-v2"
-        self.model = SentenceTransformer(model_name)
-        # load pre-computed embeddings
-        embeddings_path = self.corpus_path.replace("_corpus.json", "_sbert_embeddings.pt")
-        self.corpus_embs = torch.load(embeddings_path)
-
-
-    def retrieve_nb_ids(self, queries: List[str], curr_nb_ids: List[List[str]], topk: int): # node_ids: unused
-        batch_query_emb = self.model.encode(
-            queries, convert_to_tensor=True,
-            batch_size=self.batch_size, normalize_embeddings=True
-        )  # [B, d]
-        # print("batch_query_emb.shape:", batch_query_emb.shape)
-
-        corpus = self.corpus_embs
-        if not torch.is_tensor(corpus):
-            corpus = torch.tensor(corpus)
-        device = batch_query_emb.device
-        corpus = corpus.to()
-        corpus = torch.nn.functional.normalize(corpus, p=2, dim=1)  # [N, d]
-
-        k = min(topk, corpus.size(0))
-        nb_ids = []
-
-        for q_emb, curr_nb_id in zip(batch_query_emb, curr_nb_ids):
-            if curr_nb_id is None or len(curr_nb_id) == 0:
-                raise ValueError("curr_nb_id cannot be None or empty.")
-            # filter corpus to only curr_nb_id's neighbors
-            candidate_ids = []
-            for nb in curr_nb_id:
-                candidate_ids.extend(self.corpus[nb]["neighbors"])
-            candidate_ids = list(set(candidate_ids))  # unique
-            # print("candidate_ids:", candidate_ids)
-            if not candidate_ids:
-                nb_ids.append([])
-                continue
-            cand_idx = torch.as_tensor(candidate_ids, device=device, dtype=torch.long)
-            # print("cand_idx:", cand_idx)
-            cand_embs = corpus.index_select(0, cand_idx)  # [M, d]
-            scores = torch.nn.functional.cosine_similarity(cand_embs, q_emb.unsqueeze(0).expand_as(cand_embs), dim=1)  # [M]
-            # print("scores:", scores)
-            k = min(topk, cand_embs.size(0))
-            topk_local = torch.topk(scores, k=k).indices.tolist()
-            # print("topk_local:", topk_local)
-            topk_global = [candidate_ids[j] for j in topk_local]
-            # print("topk_global:", topk_global)
-            nb_ids.append(topk_global)
-
-        print(f"Retrieved neighbors for {len(queries)} queries: {nb_ids}.")
-        return nb_ids
-
-
-    def _search(self, query: str, node_id: str, search_hop: int, num: int):
-        if num is None:
-            num = self.topk
-        nb_ids = self.retrieve_nb_ids(node_id, search_hop, num)
-        results = [self.corpus[idx] for idx in nb_ids[0]]
-        return results
-
-    def _batch_search(self, queries: List[str], curr_nb_ids: List[List[str]], node_ids: List[str], search_hops: List[int], num: int):
-        if isinstance(queries, str):
-            queries = [queries]
-
-        results = []
-        for start_idx in tqdm(range(0, len(queries), self.batch_size), desc='Retrieval process: '):
-            query_batch = queries[start_idx:start_idx + self.batch_size]
-            curr_nb_ids_batch = curr_nb_ids[start_idx:start_idx + self.batch_size] # retrieve hop1 nbs based on ids in the requested list
-            print("query_batch:", query_batch)
-            print("curr_nb_ids_batch:", curr_nb_ids_batch)
-            batch_nb_ids = self.retrieve_nb_ids(query_batch, curr_nb_ids_batch, num)
-            flat_nb_ids = [str(i) for i in sum(batch_nb_ids, [])]
-            print("retrieved flat_nb_ids:", flat_nb_ids)
-            batch_results = [self.corpus[idx] for idx in flat_nb_ids]
-            # chunk them back
-            batch_results = [batch_results[i*num : (i+1)*num] for i in range(len(batch_nb_ids))]
-            results.extend(batch_results)
-            
-            del batch_nb_ids, query_batch, flat_nb_ids, batch_results
-            torch.cuda.empty_cache()
-        
-        return results
-
-
-
-class HopGlobalSimRetriever(BaseRetriever):
-
-    def __init__(self, config):
-        super().__init__(config)
-        self.corpus = load_corpus(self.corpus_path)
-        self.topk = config.retrieval_topk
-        self.batch_size = config.retrieval_batch_size
-        from sentence_transformers import SentenceTransformer
-        model_name = "/vast/jl11523/projects-local-models/all-mpnet-base-v2"
-        self.model = SentenceTransformer(model_name)
-        # load pre-computed embeddings
-        embeddings_path = self.corpus_path.replace("_corpus.json", "_sbert_embeddings.pt")
-        self.corpus_embs = torch.load(embeddings_path)
-        
-
-    def retrieve_nb_ids(self, queries: List[str], node_ids: List[str], curr_nb_ids: List[List[str]], topk: int): # node_ids: unused
-        batch_query_emb = self.model.encode(
-            queries, convert_to_tensor=True,
-            batch_size=self.batch_size, normalize_embeddings=True
-        )  # [B, d]
-        # print("batch_query_emb.shape:", batch_query_emb.shape)
-
-        corpus = self.corpus_embs
-        if not torch.is_tensor(corpus):
-            corpus = torch.tensor(corpus)
-        device = batch_query_emb.device
-        corpus = corpus.to()
-        corpus = torch.nn.functional.normalize(corpus, p=2, dim=1)  # [N, d]
-
-        k = min(topk, corpus.size(0))
-        nb_ids = []
-
-        for q_emb, node_id, curr_nb_id in zip(batch_query_emb, node_ids, curr_nb_ids):
-            if curr_nb_id is None or len(curr_nb_id) == 0:
-                raise ValueError("curr_nb_id cannot be None or empty.")
-            candidate_ids = []
-            # curr_nb_id's neighbors
-            for nb in curr_nb_id:
-                candidate_ids.extend(self.corpus[nb]["neighbors"])
-                candidate_ids.extend(self.corpus[nb]["ppr_neighbors"])  # include global by ppr
-            candidate_ids = list(set(candidate_ids))  # unique
-            # print("candidate_ids:", candidate_ids)
-            if not candidate_ids:
-                nb_ids.append([])
-                continue
-            cand_idx = torch.as_tensor(candidate_ids, device=device, dtype=torch.long)
-            # print("cand_idx:", cand_idx)
-            cand_embs = corpus.index_select(0, cand_idx)  # [M, d]
-            # TODO: as an API: semantic similarity, structural similarity, combined similarity
-            scores = torch.nn.functional.cosine_similarity(cand_embs, q_emb.unsqueeze(0).expand_as(cand_embs), dim=1)  # [M]
-            # print("scores:", scores)
-            k = min(topk, cand_embs.size(0))
-            topk_local = torch.topk(scores, k=k).indices.tolist()
-            # print("topk_local:", topk_local)
-            topk_global = [candidate_ids[j] for j in topk_local]
-            # print("topk_global:", topk_global)
-            nb_ids.append(topk_global)
-
-        print(f"Retrieved neighbors for {len(queries)} queries: {nb_ids}.")
-        return nb_ids
-
-
-    def _search(self, query: str, node_id: str, search_hop: int, num: int):
-        if num is None:
-            num = self.topk
-        nb_ids = self.retrieve_nb_ids(node_id, search_hop, num)
-        results = [self.corpus[idx] for idx in nb_ids[0]]
-        return results
-
-    def _batch_search(self, queries: List[str], curr_nb_ids: List[List[str]], node_ids: List[str], search_hops: List[int], num: int):
-        if isinstance(queries, str):
-            queries = [queries]
-
-        results = []
-        for start_idx in tqdm(range(0, len(queries), self.batch_size), desc='Retrieval process: '):
-            query_batch = queries[start_idx:start_idx + self.batch_size]
-            curr_nb_ids_batch = curr_nb_ids[start_idx:start_idx + self.batch_size] # retrieve hop1 nbs based on ids in the requested list
-            print("query_batch:", query_batch)
-            print("curr_nb_ids_batch:", curr_nb_ids_batch)
-            batch_nb_ids = self.retrieve_nb_ids(query_batch, node_ids, curr_nb_ids_batch, num)
-            flat_nb_ids = [str(i) for i in sum(batch_nb_ids, [])]
-            print("retrieved flat_nb_ids:", flat_nb_ids)
-            batch_results = [self.corpus[idx] for idx in flat_nb_ids]
-            # chunk them back
-            batch_results = [batch_results[i*num : (i+1)*num] for i in range(len(batch_nb_ids))]
-            results.extend(batch_results)
-            
-            del batch_nb_ids, query_batch, flat_nb_ids, batch_results
-            torch.cuda.empty_cache()
-        
-        return results
-
 
 
 def get_retriever(config):
@@ -547,6 +243,7 @@ class QueryRequest(BaseModel):
     node_ids: List[str]
     search_hops: List[int]
     topk: int
+    mode: Optional[str] = None  # Optional field for global search flag
     candidate_filter: Optional[str] = None  # Optional field for candidate filtering method
     score_method: Optional[str] = None  # Optional field for scoring method
 
@@ -562,6 +259,7 @@ def retrieve_endpoint(request: QueryRequest):
         node_ids=request.node_ids,
         search_hops=request.search_hops,
         num=request.topk,
+        mode=request.mode,
         candidate_filter=request.candidate_filter,
         score_method=request.score_method
     )
