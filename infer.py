@@ -1,3 +1,4 @@
+from vllm import LLM, SamplingParams
 import transformers
 import torch
 import random
@@ -8,6 +9,7 @@ import os
 import json
 from typing import List
 from tqdm import tqdm
+import re
 
 import pdb
 
@@ -31,28 +33,25 @@ CATEGORIES = {
                         'Clothing', 'Sports Medicine'],
 }
 
+def extract_fields(text):
+    FIELD_RE = re.compile(r"(mode|hop|query)\s*=\s*([^,]+)", flags=re.IGNORECASE)
+    # mode, hop, query
+    fields = {}
+    for key, val in FIELD_RE.findall(text):
+        fields[key.lower()] = val.strip()
 
-# Define the custom stopping criterion
-class StopOnSequence(transformers.StoppingCriteria):
-    def __init__(self, target_sequences, tokenizer):
-        # Encode the string so we have the exact token-IDs pattern
-        self.target_ids = [tokenizer.encode(target_sequence, add_special_tokens=False) for target_sequence in target_sequences]
-        self.target_lengths = [len(target_id) for target_id in self.target_ids]
-        self._tokenizer = tokenizer
+    # mode: default to local
+    mode = fields.get("mode", "local").lower() 
+    if mode not in ["local", "global", "attribute"]:  # extendable to 'attribute'
+        mode = "local"
+    # hop: default to 1
+    search_hop = fields.get("hop", 1) 
+    if int(search_hop) not in [1, 2]:
+        search_hop = 1
+    query = fields.get("query", "")
 
-    def __call__(self, input_ids, scores, **kwargs):
-        # Make sure the target IDs are on the same device
-        targets = [torch.as_tensor(target_id, device=input_ids.device) for target_id in self.target_ids]
+    return mode, int(search_hop), query
 
-        if input_ids.shape[1] < min(self.target_lengths):
-            return False
-
-        # Compare the tail of input_ids with our target_ids
-        for i, target in enumerate(targets):
-            if torch.equal(input_ids[0, -self.target_lengths[i]:], target):
-                return True
-
-        return False
 
 def get_query(text):
     import re
@@ -63,25 +62,31 @@ def get_query(text):
     else:
         return None
 
-def search(query: str, node_record: dict, search_cnt: int, curr_nb_ids: List[str], candidate_filter: str, ranker: str):
-    if ranker == "SemQA":
-            title = node_record["text"].split(";")[0]
-            query = f"{title}; Query: {query}"
-    elif ranker == "SemA": # ignore the query, only use the anchor text
-            query = node_record["text"]    
+
+def search(query: str, node_record: dict, search_hop: int, curr_nb_ids: List[str], candidate_filter: str, ranker: str, tool_use: bool = False):
+
+    if not tool_use:
+        if ranker == "SemQA":
+                title = node_record["text"].split(";")[0]
+                query = f"{title}; Query: {query}"
+        elif ranker == "SemA": # ignore the query, only use the anchor text
+                query = node_record["text"]  
+        mode = None  
+    else:
+        mode, search_hop, query = extract_fields(query)
 
     payload = {
-            "queries": [query],
-            "curr_nb_ids": [curr_nb_ids],
-            "node_ids": [str(node_record["id"])],
-            "search_hops": [search_cnt],
-            "topk": 3,
-            "candidate_filter": candidate_filter, # "Sem" or "Hop" or "PPR" or "Sem+Hop" or "Sem+PPR" or "Hop+PPR" or "Sem+Hop+PPR"
-            "score_method": ranker # ranker can be "SemQ", "SemA", "SemQA", "WeightedSemQA", "StrucSemQA"(not clear yet)
-        }
-
-    print("[POST] payload:", payload)
-    results = requests.post("http://127.0.0.1:8000/retrieve", json=payload).json()['result']
+                "queries": [query],
+                "curr_nb_ids": [curr_nb_ids],
+                "node_ids": [str(node_record["id"])],
+                "search_hops": [search_hop],
+                "topk": 3,
+                "mode": mode,
+                "candidate_filter": candidate_filter, # "Sem" or "Hop" or "PPR" or "Sem+Hop" or "Sem+PPR" or "Hop+PPR" or "Sem+Hop+PPR"
+                "score_method": ranker # ranker can be "SemQ", "SemA", "SemQA", "WeightedSemQA", "StrucSemQA"(not clear yet)
+            }
+    # print("[POST] payload:", payload)
+    results = requests.post(f"http://127.0.0.1:{args.port}/retrieve", json=payload).json()['result']
 
     def _passages2string(retrieval_result):
         format_reference = ''
@@ -98,7 +103,127 @@ def search(query: str, node_record: dict, search_cnt: int, curr_nb_ids: List[str
     return _passages2string(results[0])
 
 
+
+def make_prompt_tooluse(dataset, record):
+    if dataset.lower() in ["cora", "pubmed", "arxiv"]:
+        platform = dataset.capitalize()
+        node_type = "paper"
+        relation_type = "citation"
+    elif dataset.lower() in ["computers", "sports", "products"]:
+        platform = "Amazon"
+        node_type = "product"
+        relation_type = "co-purchase" 
+
+    task_desc = (
+        f"You are a reasoning assistant for node classification on an {platform} dataset graph."
+        f"Your goal is to select the most likely category for the target node from the provided list.\n\n"
+        "Tools:\n"
+        "- To perform a search, use this schema exactly: <search> mode={local|global|attribute}, hop={1|2}, query={your query with keywords} </search>\n"
+        "   • mode=local: recall neighbors of within 1-2 hops of the target node and you must specify hop=1 or hop=2\n" 
+        "   • mode=global: recall from a global nodes pool (e.g., PageRank)\n"
+        "   • mode=attribute: recall purely by node attribute similarity\n"
+        "- The graph retriever considers both the graph structure and the semantic similarity of your query, and returns the most relevant data inside <information> ... </information>.\n"
+        "- You can search multiple times if needed, and don't guess without searching or keep searching once you have enough evidence.\n"
+        "- Perform at least one search before giving the final answer, and you can repeat the search process multiple times if necessary.\n\n"
+    )
+    reasoning_policy = (
+        "Reasoning protocol:\n"
+        "- Begin with <think>...</think> to assess if attributes and graph stats are sufficient.\n"
+        "- Whenever you receive new information, first reason inside <think> ... </think>.\n" 
+        "- If no further information is needed, output only your final choice inside <answer> ... </answer> (no extra explanation).\n\n"
+        "Decision Policy:\n"
+        "- Rich attributes → predict after one search.\n"
+        "- Weak/incomplete → mode=local, hop=1; if ambiguous and degree moderate/high → mode=local, hop=2.\n"
+        "- Very low degree or conflicting neighbors → mode=global.\n"
+        "- Sparse/missing edges → mode=attribute.\n\n"
+        "Example:\n"
+        "Question: ...\n"
+        "Assistant:"
+        "<think> …your reasoning...</think>"
+        "<search> …your query… </search>"
+        "<information>...retriever results...</information>"
+        "<think>...reasoning with the new information...</think>"
+        "<answer>Movies</answer>\n\n"
+        "Use the following information for the node classification task:\n\n"
+    )
+
+    node_text = record['text']
+    node_text = " ".join(node_text.split()[:600]) # truncate to 400 words
+    node_info = f"- The target {node_type}'s information: {node_text}\n"
+
+    degree = record['degree']
+    avg_degree = record['dataset_avg_degree']
+    domain_info = (
+        "- The domain knowledge:"
+        f"Each node represents a {node_type} and connected to other {node_type}s through {relation_type} relationships."
+        f"The degree of target node is {degree}, while the average degree of the dataset is {avg_degree}.\n"
+    )
+
+    categories = CATEGORIES[dataset]
+    category_list = f"- The category list: {'; '.join(categories)}.\n"
+
+    # final prompt
+    prompt = task_desc + reasoning_policy + node_info + domain_info + category_list
+    return prompt
+
+
+
 def make_prompt(dataset, record):
+    if dataset.lower() in ["cora", "pubmed", "arxiv"]:
+        platform = dataset.capitalize()
+        node_type = "paper"
+        relation_type = "citation"
+    elif dataset.lower() in ["computers", "sports", "products"]:
+        platform = "Amazon"
+        node_type = "product"
+        relation_type = "co-purchase" 
+
+    task_desc = (
+        f"You are a reasoning assistant for node classification on an {platform} dataset graph."
+        f"Your goal is to select the most likely category for the target node from the provided list.\n"
+        "Tools:\n"
+        "- To perform a search, write <search> your query here </search>.\n" 
+        "- The graph retriever considers both the graph structure and the semantic similarity of your query, and returns the most relevant data inside <information> ... </information>.\n"
+        "- You can repeat the search process multiple times if necessary.\n"
+        "- You must perform at least one search before answering. Do not guess without searching, but also avoid unnecessary repeated searches once you have enough evidence."
+    )
+    reasoning_policy = (
+        "Reasoning protocol:\n"
+        "- Whenever you receive new information, first reason inside <think> ... </think>.\n" 
+        "- If no further information is needed, output only your final choice inside <answer> ... </answer> (no extra explanation).\n"
+        "Example:\n"
+        "Question: ...\n"
+        "Assistant:"
+        "<think> …your reasoning...</think>"
+        "<search> …your query… </search>"
+        "<information>...retriever results...</information>"
+        "<think>...reasoning with the new information...</think>"
+        "<answer>Movies</answer>\n\n"
+        "Use the following information for the node classification task:\n"
+    )
+
+    node_text = record['text']
+    node_text = " ".join(node_text.split()[:600]) # truncate to 400 words
+    node_info = f"- The target {node_type}'s information: {node_text}\n"
+
+    degree = record['degree']
+    avg_degree = record['dataset_avg_degree']
+    domain_info = (
+        "- The domain knowledge:"
+        f"Each node represents a {node_type} and connected to other {node_type}s through {relation_type} relationships."
+        f"The degree of target node is {degree}, while the average degree of the dataset is {avg_degree}.\n"
+    )
+
+    categories = CATEGORIES[dataset]
+    category_list = f"- The category list: {'; '.join(categories)}.\n"
+
+    # final prompt
+    prompt = task_desc + reasoning_policy + node_info + domain_info + category_list
+    return prompt
+
+
+
+def make_prompt_old(dataset, record):
     if dataset.lower() in ["cora", "pubmed", "arxiv"]:
         platform = dataset.capitalize()
         node_type = "paper"
@@ -144,12 +269,14 @@ def make_prompt(dataset, record):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    parser.add_argument("--port", type=int, default=8000) # float16 or bfloat16
     parser.add_argument("--model_id", type=str, default="/vast/jl11523/projects-local-models/SearchR1-nq_hotpotqa_train-qwen2.5-7b-em-ppo") # /vast/jl11523/projects-local-models/Qwen2.5-32B-Instruct
     parser.add_argument("--dataset", type=str, default="cora")
     parser.add_argument("--start_idx", type=int, default=0)
     parser.add_argument("--output_path", type=str, default="./results/output.json")
     parser.add_argument("--candidate_filter", type=str, default="Hop+PPR") # "Sem" or "Hop" or "PPR" or "Sem+Hop" or "Sem+PPR" or "Hop+PPR" or "Sem+Hop+PPR"
     parser.add_argument("--ranker", type=str, default="SemQA") # ranker can be "SemQ", "SemA", "SemQA", "WeightedSemQA", "StrucSemQA"(not clear yet)
+    parser.add_argument("--usetool", type=bool, default=False) # whether to use the tool-using prompt and parse the query fields
     args = parser.parse_args()
 
     model_id = args.model_id
@@ -168,16 +295,33 @@ if __name__ == "__main__":
     print("[model_id]:", model_id)
     print("[output_path]:", output_path)
 
-
     # Initialize the tokenizer and model
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    tokenizer = transformers.AutoTokenizer.from_pretrained(model_id)
-    model = transformers.AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.bfloat16, device_map="auto")
-    # Initialize the stopping criteria
-    target_sequences = ["</search>", " </search>", "</search>\n", " </search>\n", "</search>\n\n", " </search>\n\n"]
-    stopping_criteria = transformers.StoppingCriteriaList([StopOnSequence(target_sequences, tokenizer)])
+      
+    # VLLM
+    tokenizer = transformers.AutoTokenizer.from_pretrained(model_id) #, trust_remote_code=True)
+    llm = LLM(
+        model=model_id,                     # e.g., "/vast/.../Qwen2.5-32B-Instruct"
+        dtype="bfloat16",                   # match your previous torch_dtype
+        tensor_parallel_size=max(torch.cuda.device_count(), 1),
+        # trust_remote_code=True,
+        # optional performance knobs:
+        max_model_len=8192,                 # adjust to your context length
+        swap_space=8,                       # GB CPU swap for long prompts (optional)
+    )
+    # stop strings for the “search” turn
+    STOP_STRINGS = ["</search>", " </search>", "</search>\n", " </search>\n",
+                    "</search>\n\n", " </search>\n\n",
+                    "</answer>", "</answer>\n", "</answer>\n\n"]
+
+    sampling_params = SamplingParams(
+        max_tokens=1024,
+        temperature=0.7,
+        stop=STOP_STRINGS,                 # vLLM will stop exactly at </search> variants
+        # You do NOT need to specify EOS; vLLM handles it automatically
+    )
+
     # model special tokens
-    curr_eos = [151645, 151643] # for Qwen2.5 series models
     curr_search_template = '\n\n{output_text}<information>{search_results}</information>\n\n'
 
     with open(corpus_path, "r") as f:
@@ -189,66 +333,61 @@ if __name__ == "__main__":
     ids_list = [x for x in ids_read.split(',')]
 
     out_fp = open(output_path, "w", encoding="utf-8")
-    # inference on the test set
-    # for node_id, record in tqdm(all_nodes.items()):
-    #     if record['split'] != "test":
-    #         continue
     for node_id in tqdm(ids_list[args.start_idx:], total=len(ids_list), initial=args.start_idx, desc="Processing"):
+        # print("="*40)
         record = all_nodes[node_id] # node_id: str
 
-        prompt = make_prompt(dataset, record)
+        if args.usetool:
+            # print(f"[Node {node_id}] Use tool-using prompt template.")
+            prompt = make_prompt_tooluse(dataset, record)
+        else:
+            # print(f"[Node {node_id}] Use direct prompt template.")
+            prompt = make_prompt(dataset, record)
 
         if tokenizer.chat_template:
             prompt = tokenizer.apply_chat_template([{"role": "user", "content": prompt}], add_generation_prompt=True, tokenize=False)
-
-        # print('\n\n################# [Start Reasoning + Searching] ##################\n\n')
-        # print(prompt)
     
         original_prompt = prompt
         search_cnt = 0
         whole_output = ""
         # Encode the chat-formatted prompt and move it to the correct device
         while True:
-            input_ids = tokenizer.encode(prompt, return_tensors='pt').to(device)
-            attention_mask = torch.ones_like(input_ids)
-            
-            # Generate text with the stopping criteria
-            outputs = model.generate(
-                input_ids,
-                attention_mask=attention_mask,
-                max_new_tokens=1024,
-                stopping_criteria=stopping_criteria,
-                pad_token_id=tokenizer.eos_token_id,
-                do_sample=True,
-                temperature=0.7
-            )
+            # print("prompt:", prompt)
+            # vLLM
+            res = llm.generate([prompt], sampling_params)
+            out = res[0].outputs[0]    # top hypothesis
+            output_text = out.text         # vLLM returns only the generated continuation text
 
-            if outputs[0][-1].item() in curr_eos:
-                generated_tokens = outputs[0][input_ids.shape[1]:]
-                output_text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
-                whole_output += output_text
+            stop_reason = getattr(out, "stop_reason", None)
+            if stop_reason in STOP_STRINGS:
+                output_text += stop_reason
+            whole_output += output_text
+            # print(f"[Generation] output_text:", output_text)
+
+            if "</answer>" in output_text:
                 break
 
-            generated_tokens = outputs[0][input_ids.shape[1]:]
-            output_text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
-            tmp_query = get_query(tokenizer.decode(outputs[0], skip_special_tokens=True))
+            tmp_query = get_query(output_text)
+            # print(f"[Generation] tmp_query:", tmp_query)
 
-            # print(f"[Generation] output_text:", output_text)
             if tmp_query:
+                if "mode=" not in tmp_query or "query=" not in tmp_query:
+                    # print(f"[Bad Query Warning] Invalid query format: {tmp_query}, use default local 1-hop search.")
+                    tmp_query = f"<search> mode=local, hop=1, query={tmp_query} </search>"
                 search_cnt += 1
                 if search_cnt == 1:
                     retrived_nb_ids = [node_id]
-                # print(f"[Search {search_cnt}] query:", tmp_query, "retrived_nb_ids:", retrived_nb_ids)
                 if len(retrived_nb_ids) == 0: # no neighbor
                     search_results = 'No relevant information found.\n'
                 else:
-                    search_results, retrived_nb_ids = search(tmp_query, record, search_cnt, retrived_nb_ids, candidate_filter, ranker)
+                    search_results, retrived_nb_ids = search(tmp_query, record, search_cnt, retrived_nb_ids, candidate_filter, ranker, tool_use=True)
             else:
                 search_results = ''
-           
+
             search_text = curr_search_template.format(output_text=output_text, search_results=search_results)
             prompt += search_text
-            whole_output += search_text
+            whole_output += f"<information>{search_results}</information>\n\n"
+            # print(f"[Generation] whole_output:", whole_output)
 
         infer_result = {
             "node_id": node_id,
